@@ -17,7 +17,10 @@ from common.cv2_util import get_image_transform_resize_crop, intrinsic_transform
 from common.cv_util import back_projection
 from common.timestamp_accumulator import get_accumulate_timestamp_idxs
 from common.replay_buffer import ReplayBuffer
-from common.svo_utils import SVOReader
+try:
+    from common.svo_utils import SVOReader
+except Exception:
+    SVOReader = None
 from common.pose_util import euler_pose_to_mat, mat_to_pose, mat_to_euler_pose, pose_to_mat
 from common.interpolation_util import PoseInterpolator, get_interp1d
 from human_data.constants import yfxrzu2standard
@@ -196,131 +199,171 @@ def conversion_single_trajectory(
     # ========================== Transformation to Egocentric View (By Default T=0 Head View) =================================
 
     svo_path = os.path.join(save_dir, "recording.svo2")
-    svo_stereo, svo_depth, svo_pointcloud = False, False, False
-    if mode in ['d', 'a']:
-        svo_depth = True
-    if mode in ['s', 'a']:
-        svo_stereo = True
-    if mode in ['p', 'a']:
-        svo_pointcloud = True
-    
-    with open(os.path.join(save_dir, "device_id.txt"), "r") as f:
-        serial_id = f.read().strip()
-    svo_camera = SVOReader(svo_path, serial_number=serial_id)
-    svo_camera.set_reading_parameters(image=True, depth=svo_depth, pointcloud=svo_pointcloud, concatenate_images=False)
-    frame_count = svo_camera.get_frame_count()
-    width, height = svo_camera.get_frame_resolution()
-
-    camera_info = svo_camera.get_camera_information()
-    # print(f"Camera Information: {(width, height)}, {out_resolutions_resize}, {out_resolutions_crop}, {out_resolutions_image_final}")
-    camera_info['left_intrinsic'] = intrinsic_transform_resize(camera_info['left_intrinsic'], input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop)
-    camera_info['right_intrinsic'] = intrinsic_transform_resize(camera_info['right_intrinsic'], input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop)
-    camera_info['left_intrinsic_final'] = intrinsic_transform_resize(camera_info['left_intrinsic'], input_res=out_resolutions_crop, output_resize_res=out_resolutions_image_final, output_crop_res=out_resolutions_image_final)
-    camera_info['right_intrinsic_final'] = intrinsic_transform_resize(camera_info['right_intrinsic'], input_res=out_resolutions_crop, output_resize_res=out_resolutions_image_final, output_crop_res=out_resolutions_image_final)
-    camera_info_key = ['stereo_transform', "left_intrinsic", "right_intrinsic", "left_intrinsic_final", "right_intrinsic_final"]
-    for key in camera_info_key:
-        episode["camera0_" + key] = np.array([camera_info[key]] * episode_length)
-
-    next_global_idx = 0
-    
-    obs_dict = dict()
-    episode['camera0_real_timestamp'] = np.zeros((episode_length,), dtype=np.float64)
-    transform_img = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, bgr_to_rgb=True)
-    obs_dict['rgb'] = ('image', f'{serial_id}_left', transform_img)
-    if svo_stereo:
-        obs_dict['rgb_right'] = ('image', f'{serial_id}_right', transform_img)
-    if svo_depth:
-        transform_depth = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, is_depth=True)
-        obs_dict['depth'] = ('depth', f'{serial_id}_left', transform_depth)
-        if svo_stereo:
-            obs_dict['depth_right'] = ('depth', f'{serial_id}_right', transform_depth)
-    if svo_pointcloud:
-        transform_pointcloud = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, is_depth=True)
-        obs_dict['pointcloud'] = ('pointcloud', f'{serial_id}_left', transform_pointcloud)
-    start_time = episode['timestamp'][0]
+    mp4_path = os.path.join(save_dir, "rgb.mp4")
 
     frame_cut_fp = os.path.join(save_dir, "frame_cut.txt")
     frame_cut = None
     if os.path.exists(frame_cut_fp):
-        # read the number in txt
         with open(frame_cut_fp, "r") as f:
             frame_cut = f.read().strip()
         if frame_cut.isdigit():
             frame_cut = int((episode_org['timestamp'][int(frame_cut) - start_time_idx] - T_start) / dt)
         else:
             print(f"Frame cut {frame_cut} is not a digit, set to None.")
-            frame_cut = None 
+            frame_cut = None
     if frame_cut is not None:
         episode_length = min(episode_length, frame_cut)
     for episode_key in episode.keys():
         episode[episode_key] = episode[episode_key][:episode_length]
 
-    global_idx = 0
-        
-    for t in range(frame_count):
-        # print(f"{t}: {next_global_idx}")
-        svo_output = svo_camera.read_camera(return_timestamp=True)
-        if svo_output is None:
-            break
+    episode['camera0_real_timestamp'] = np.zeros((episode_length,), dtype=np.float64)
+
+    if os.path.exists(svo_path):
+        # -------- ZED SVO path --------
+        svo_stereo, svo_depth, svo_pointcloud = False, False, False
+        if mode in ['d', 'a']:
+            svo_depth = True
+        if mode in ['s', 'a']:
+            svo_stereo = True
+        if mode in ['p', 'a']:
+            svo_pointcloud = True
+
+        with open(os.path.join(save_dir, "device_id.txt"), "r") as f:
+            serial_id = f.read().strip()
+        svo_camera = SVOReader(svo_path, serial_number=serial_id)
+        svo_camera.set_reading_parameters(image=True, depth=svo_depth, pointcloud=svo_pointcloud, concatenate_images=False)
+        frame_count = svo_camera.get_frame_count()
+        width, height = svo_camera.get_frame_resolution()
+
+        camera_info = svo_camera.get_camera_information()
+        camera_info['left_intrinsic'] = intrinsic_transform_resize(camera_info['left_intrinsic'], input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop)
+        camera_info['right_intrinsic'] = intrinsic_transform_resize(camera_info['right_intrinsic'], input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop)
+        camera_info['left_intrinsic_final'] = intrinsic_transform_resize(camera_info['left_intrinsic'], input_res=out_resolutions_crop, output_resize_res=out_resolutions_image_final, output_crop_res=out_resolutions_image_final)
+        camera_info['right_intrinsic_final'] = intrinsic_transform_resize(camera_info['right_intrinsic'], input_res=out_resolutions_crop, output_resize_res=out_resolutions_image_final, output_crop_res=out_resolutions_image_final)
+        for key in ['stereo_transform', "left_intrinsic", "right_intrinsic", "left_intrinsic_final", "right_intrinsic_final"]:
+            episode["camera0_" + key] = np.array([camera_info[key]] * episode_length)
+
+        next_global_idx = 0
+        obs_dict = dict()
+        start_time = episode['timestamp'][0]
+        transform_img = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, bgr_to_rgb=True)
+        obs_dict['rgb'] = ('image', f'{serial_id}_left', transform_img)
+        if svo_stereo:
+            obs_dict['rgb_right'] = ('image', f'{serial_id}_right', transform_img)
+        if svo_depth:
+            transform_depth = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, is_depth=True)
+            obs_dict['depth'] = ('depth', f'{serial_id}_left', transform_depth)
+            if svo_stereo:
+                obs_dict['depth_right'] = ('depth', f'{serial_id}_right', transform_depth)
+        if svo_pointcloud:
+            transform_pointcloud = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, is_depth=True)
+            obs_dict['pointcloud'] = ('pointcloud', f'{serial_id}_left', transform_pointcloud)
+
+        global_idx = 0
+        for t in range(frame_count):
+            svo_output = svo_camera.read_camera(return_timestamp=True)
+            if svo_output is None:
+                break
+            else:
+                data_dict, timestamp = svo_output
+                timestamp = timestamp / 1000.0
+            if timestamp < episode['timestamp'][0] - dt:
+                continue
+
+            local_idxs, global_idxs, next_global_idx \
+                    = get_accumulate_timestamp_idxs(
+                    timestamps=[timestamp],
+                    start_time=start_time,
+                    dt=dt,
+                    next_global_idx=next_global_idx
+                )
+
+            if len(global_idxs) > 0:
+                for global_idx in global_idxs:
+                    if global_idx == episode_length:
+                        break
+                    for key in obs_dict.keys():
+                        value = data_dict[obs_dict[key][0]][obs_dict[key][1]]
+                        transform = obs_dict[key][2]
+                        if value.shape[-1] == 4:
+                            value = value[..., :3]
+                        value = transform(value)
+                        if 'rgb' in key:
+                            value = cv2.resize(value, out_resolutions_image_final, interpolation=cv2.INTER_LINEAR)
+                        if 'pointcloud' in key:
+                            points_xyz = value.reshape(-1, 3)
+                            points_rgb = obs_dict['rgb'][2](data_dict['image'][obs_dict[key][1]][..., :3]).reshape(-1, 3)
+                            points = np.concatenate([points_xyz, points_rgb / 255.0], axis=-1)
+                            valid_mask = np.linalg.norm(points_xyz, axis=-1) <= points_max_distance_final
+                            points = points[valid_mask]
+                            points_xyz = points_xyz[valid_mask]
+                            if len(points) > num_points_final:
+                                points_idx = fpsample.bucket_fps_kdline_sampling(points_xyz, num_points_final, h=7)
+                            else:
+                                points_idx = np.array([i % len(points_xyz) for i in range(num_points_final)])
+                            value = points[points_idx]
+                        if 'camera0_' + key not in episode.keys():
+                            episode['camera0_' + key] = np.zeros((episode_length,) + value.shape, dtype=value.dtype)
+                        episode['camera0_' + key][global_idx] = value
+                    episode['camera0_real_timestamp'][global_idx] = timestamp
+            if (next_global_idx == episode_length) or (global_idx == episode_length):
+                break
+
+        if (next_global_idx < episode_length) and (global_idx != episode_length):
+            abandoned_frames = episode_length - next_global_idx
+            for key in episode.keys():
+                try:
+                    episode[key] = episode[key][:-abandoned_frames]
+                except:
+                    pass
+            print(f"Warning: {next_global_idx} < {episode_length}, abandoned {abandoned_frames} frames.")
+
+    elif os.path.exists(mp4_path):
+        # -------- RealSense MP4 path (mode='o' only) --------
+        if mode != 'o':
+            print(f"[Warning] RealSense mp4 data only supports mode='o', ignoring depth/stereo/pointcloud.")
+
+        intrinsic_path = os.path.join(save_dir, "camera_intrinsic.npy")
+        if os.path.exists(intrinsic_path):
+            raw_intrinsic = np.load(intrinsic_path)
         else:
-            data_dict, timestamp = svo_output
-            timestamp = timestamp / 1000.0
-        if timestamp < episode['timestamp'][0] - dt:
-            continue
+            print(f"[Warning] No camera_intrinsic.npy in {save_dir}, using identity matrix.")
+            raw_intrinsic = np.eye(3)
 
-        local_idxs, global_idxs, next_global_idx \
-                = get_accumulate_timestamp_idxs(
-                timestamps=[timestamp],
-                start_time=start_time,
-                dt=dt,
-                next_global_idx=next_global_idx
-            )
+        reader = imageio.get_reader(mp4_path)
+        meta = reader.get_meta_data()
+        width, height = meta['size']  # (W, H)
 
-        if len(global_idxs) > 0:
-            for global_idx in global_idxs:
-                if global_idx == episode_length:
-                    break
-                for key in obs_dict.keys():
-                    value = data_dict[obs_dict[key][0]][obs_dict[key][1]]
-                    transform = obs_dict[key][2]
-                    if value.shape[-1] == 4:
-                        value = value[..., :3]
-                    value = transform(value)
-                    if 'rgb' in key:
-                        value = cv2.resize(value, out_resolutions_image_final, interpolation=cv2.INTER_LINEAR)
-                    if 'pointcloud' in key:
-                        points_xyz = value.reshape(-1, 3)
-                        points_rgb = obs_dict['rgb'][2](data_dict['image'][obs_dict[key][1]][..., :3]).reshape(-1, 3)
-                        points = np.concatenate([points_xyz, points_rgb / 255.0], axis=-1)
-                        # remove NaN point and distance > points_max_distance_final
-                        valid_mask = np.linalg.norm(points_xyz, axis=-1) <= points_max_distance_final
-                        # valid_mask = valid_mask & np.isfinite(points).all(axis=-1) & (~ np.isnan(points).any(axis=-1))
-                        points = points[valid_mask]
-                        points_xyz = points_xyz[valid_mask]
-                        # np.save("points_org.npy", points)
-                        if len(points) > num_points_final:
-                            # do furthest point sampling, resulting num_points_final points
-                            points_idx = fpsample.bucket_fps_kdline_sampling(points_xyz, num_points_final, h=7)
-                        else:
-                            # repeat points in points to num_points_final
-                            points_idx = np.array([i % len(points_xyz) for i in range(num_points_final)])
-                        value = points[points_idx]
-                        # np.save("points_ds.npy", value)
-                    if 'camera0_' + key not in episode.keys():
-                        episode['camera0_' + key] = np.zeros((episode_length,) + value.shape, dtype=value.dtype)
-                    episode['camera0_' + key][global_idx] = value
-                episode['camera0_real_timestamp'][global_idx] = timestamp
-        if (next_global_idx == episode_length) or (global_idx == episode_length):
-            break
-        
-    if (next_global_idx < episode_length) and (global_idx != episode_length):
-        abandoned_frames = episode_length - next_global_idx
-        for key in episode.keys():
-            try:
-                episode[key] = episode[key][:-abandoned_frames]
-            except:
-                pass
-        print(f"Warning: {next_global_idx} < {episode_length}, abandoned {abandoned_frames} frames.")
+        left_intrinsic = intrinsic_transform_resize(raw_intrinsic, input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop)
+        left_intrinsic_final = intrinsic_transform_resize(left_intrinsic, input_res=out_resolutions_crop, output_resize_res=out_resolutions_image_final, output_crop_res=out_resolutions_image_final)
+        for key, val in [('stereo_transform', np.eye(4)), ('left_intrinsic', left_intrinsic), ('right_intrinsic', left_intrinsic), ('left_intrinsic_final', left_intrinsic_final), ('right_intrinsic_final', left_intrinsic_final)]:
+            episode["camera0_" + key] = np.array([val] * episode_length)
+
+        ts_path = os.path.join(save_dir, "camera_timestamps.npy")
+        frames = list(reader)
+        reader.close()
+        n_frames = len(frames)
+        if os.path.exists(ts_path):
+            frame_timestamps = np.load(ts_path)
+        else:
+            fps = meta.get('fps', 30.0)
+            frame_timestamps = episode['timestamp'][0] + np.arange(n_frames) / fps
+
+        transform_img = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, bgr_to_rgb=False)
+
+        episode['camera0_rgb'] = np.zeros((episode_length, out_resolutions_image_final[1], out_resolutions_image_final[0], 3), dtype=np.uint8)
+        for global_idx in range(episode_length):
+            t = episode['timestamp'][global_idx]
+            frame_idx = int(np.argmin(np.abs(frame_timestamps - t)))
+            frame_idx = min(frame_idx, n_frames - 1)
+            frame = transform_img(frames[frame_idx])
+            frame = cv2.resize(frame, out_resolutions_image_final, interpolation=cv2.INTER_LINEAR)
+            episode['camera0_rgb'][global_idx] = frame
+            episode['camera0_real_timestamp'][global_idx] = frame_timestamps[frame_idx]
+
+    else:
+        print(f"[Warning] No recording.svo2 or rgb.mp4 found in {save_dir}, skipping video.")
+        return None
 
     n_length = np.min([episode['timestamp'].shape[-1], episode['camera0_real_timestamp'].shape[-1]])
     for key in episode.keys():

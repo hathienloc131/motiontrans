@@ -9,7 +9,11 @@ import argparse
 import keyboard
 
 from human_data.quest_recorder import QuestRecorder
-from human_data.camera_zed_simple import CameraZedSimple
+try:
+    from human_data.camera_zed_simple import CameraZedSimple
+except Exception:
+    CameraZedSimple = None
+from human_data.camera_realsense_simple import CameraLiteRealSense
 
 def calibration_camera(args):
 
@@ -74,7 +78,15 @@ def calibration_processor(objpoints, imgpoints, gray):
 def step1_anchor_camera(args):
 
     resolution = (1280, 720)
-    if True:
+    if args.camera == 'realsense':
+        serial_number_list = CameraLiteRealSense.get_connected_devices_serial()
+        print(serial_number_list)
+        device_id = serial_number_list[0]
+        camera = CameraLiteRealSense(
+            device_id=device_id,
+            resolution=resolution,
+        )
+    else:
         serial_number_list = CameraZedSimple.get_connected_devices_serial()
         print(serial_number_list)
         device_id = serial_number_list[0]
@@ -83,13 +95,14 @@ def step1_anchor_camera(args):
             resolution=resolution,
         )
 
-        raw_intrinsic = camera.get_intrinsic_left_cam()
-        raw_distoration = camera.get_intrinsic_left_dist()
-        resolution = np.array([resolution[0], resolution[1]])
-        np.save(os.path.join(args.save_dir, "camera_intrinsic.npy"), raw_intrinsic)
-        np.save(os.path.join(args.save_dir, "camera_distoration.npy"), raw_distoration)
-        np.save(os.path.join(args.save_dir, "camera_resolution.npy"), resolution)
+    raw_intrinsic = camera.get_intrinsic_left_cam()
+    raw_distoration = camera.get_intrinsic_left_dist()
+    resolution_arr = np.array([resolution[0], resolution[1]])
+    np.save(os.path.join(args.save_dir, "camera_intrinsic.npy"), raw_intrinsic)
+    np.save(os.path.join(args.save_dir, "camera_distoration.npy"), raw_distoration)
+    np.save(os.path.join(args.save_dir, "camera_resolution.npy"), resolution_arr)
 
+    if True:
         def get_camera_image_stream():
             try:
                 last_camera_data = camera.recieve()
@@ -194,7 +207,7 @@ if __name__ == "__main__":
 
     arg_parser = argparse.ArgumentParser()
     arg_parser.add_argument('--camera_params_dir', type=str, default="camera_params")
-    arg_parser.add_argument('--camera', type=str, default='zed', help="zed, ")
+    arg_parser.add_argument('--camera', type=str, default='zed', choices=['zed', 'realsense'])
     arg_parser.add_argument('--checkboard_h', type=int, default=8)
     arg_parser.add_argument('--checkboard_w', type=int, default=5)
     arg_parser.add_argument('--square_size', type=int, default=30, help="mm")

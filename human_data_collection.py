@@ -7,16 +7,21 @@ import pathlib
 import pickle
 import cv2
 from human_data.quest_recorder import QuestRecorder
-from human_data.camera_zed_simple import CameraZedSimple
+try:
+    from human_data.camera_zed_simple import CameraZedSimple
+except Exception:
+    CameraZedSimple = None
+from human_data.camera_realsense_simple import CameraLiteRealSense
 from common.precise_sleep import precise_wait
 from common.timestamp_accumulator import ObsAccumulator
+import numpy as np
 
 
 def get_zed_camera(args, verbose=False, add_record=False):
 
     resolution = (1280, 720)
     num_threads = 2
-    
+
     print("VideoStereoRecorder Initialization completed")
     serial_number_list = CameraZedSimple.get_connected_devices_serial()
     print(serial_number_list)
@@ -38,6 +43,24 @@ def get_zed_camera(args, verbose=False, add_record=False):
     return camera, device_id
 
 
+def get_realsense_camera(args, verbose=False):
+
+    resolution = (args.mp4_crop_w, args.mp4_crop_h) if (args.mp4_crop_w and args.mp4_crop_h) else (1280, 720)
+
+    print("RealSense Initialization")
+    serial_number_list = CameraLiteRealSense.get_connected_devices_serial()
+    print(serial_number_list)
+    device_id = serial_number_list[0]
+
+    camera = CameraLiteRealSense(
+        device_id=device_id,
+        resolution=resolution,
+        capture_fps=args.frequency,
+    )
+
+    return camera, device_id
+
+
 def start_record(args, quest, camera, device_id, dt):
     assert quest.data_dir is not None
     save_dir = quest.data_dir
@@ -45,8 +68,10 @@ def start_record(args, quest, camera, device_id, dt):
     with open(os.path.join(save_dir, "device_id.txt"), "w") as f:
         f.write(device_id)
     if not args.no_camera:
-        camera.start_recording(video_path=str(video_paths_only_camera))  # FIXME: 0.2 secs human can not move
-    # print(f"camera start recording time: {time.time()-st}")
+        if hasattr(camera, 'get_intrinsic_left_cam'):
+            intrinsic = camera.get_intrinsic_left_cam()
+            np.save(os.path.join(save_dir, "camera_intrinsic.npy"), intrinsic)
+        camera.start_recording(video_path=str(video_paths_only_camera))
     action_accumulator = ObsAccumulator()
     return action_accumulator, save_dir
     
@@ -54,10 +79,13 @@ def start_record(args, quest, camera, device_id, dt):
 
 def main(args):
     
-    camera = None 
+    camera = None
     if True:
         if not args.no_camera:
-            camera, device_id = get_zed_camera(args, verbose=(not args.no_verbose), add_record=(not args.no_mp4_record))
+            if args.camera == 'realsense':
+                camera, device_id = get_realsense_camera(args, verbose=(not args.no_verbose))
+            else:
+                camera, device_id = get_zed_camera(args, verbose=(not args.no_verbose), add_record=(not args.no_mp4_record))
 
         img = camera.recieve()
         os.makedirs(args.output_dir, exist_ok=True)
@@ -161,6 +189,7 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--frequency", type=int, default=30)
     parser.add_argument("-o", "--output_dir", type=str, required=True)
+    parser.add_argument("--camera", type=str, default='zed', choices=['zed', 'realsense'])
     parser.add_argument("-z", "--camera_exposure", type=int, default=None)
     parser.add_argument("--no_mp4_record", action="store_true", default=False, help="only svo, not record mp4 video stream for data filter")
     parser.add_argument("--no_verbose", action="store_true", default=False)

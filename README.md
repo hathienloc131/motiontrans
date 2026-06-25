@@ -30,7 +30,14 @@ pip install torch torchvision peft open3d viser
 pip install huggingface-hub==0.21.4 pin==3.3.1 numpy==1.24.4
 ```
 
-Since we rely on ZED2 camera for visual observation, please also install the [ZED SDK](https://www.stereolabs.com/docs/app-development/python/install) following the official instruction.
+**Camera options (choose one):**
+
+- **ZED2** (default): Install the [ZED SDK](https://www.stereolabs.com/docs/app-development/python/install) following the official instruction. Note: ZED SDK is only supported on **Linux and Windows** (not macOS).
+- **Intel RealSense D400 series** (alternative): Install `pyrealsense2` instead:
+  ```
+  pip install pyrealsense2
+  ```
+  RealSense support works on Linux, Windows, and **macOS**. See the [RealSense setup notes](#realsense-camera-option) below for details.
 
 ## (1) Robot Teleoperation
 
@@ -39,6 +46,44 @@ Please following [documents/1.robot_teleoperation.md](./documents/1.robot_teleop
 ## (2) Human Data Collection
 
 Please following [documents/2.human_data_collection.md](./documents/2.human_data_collection.md)
+
+### RealSense Camera Option
+
+To use an Intel RealSense D400 camera instead of ZED2, pass `--camera realsense` to the collection and calibration scripts.
+
+**Calibration** (redo required when switching camera model):
+```bash
+# Collects checkerboard + Quest anchor data, saves to camera_params/quest_realsense/
+python -m scripts_data.vr_calibration_device_data_collection --camera realsense
+
+# Compute the quest-to-camera transform
+python -m scripts_data.vr_calibration_device_result_calculation \
+    --save_dir camera_params/quest_realsense \
+    -i camera_intrinsic.npy -b ${corner_idx} \
+    --resolution_resize 1280x720 --resolution_crop 640x480
+```
+
+**Data collection:**
+```bash
+# Edit scripts/mocap.sh and add --camera realsense, or run directly:
+python human_data_collection.py --camera realsense -o data/raw_data/raw_data_human
+```
+Each recorded episode saves `camera_intrinsic.npy` and `camera_timestamps.npy` alongside `rgb.mp4` (replaces ZED's `recording.svo2`).
+
+**Data conversion** — update `calib_quest2camera_file` and optionally `resolution_resize` in the script:
+```bash
+# In scripts_data/zarr_human_data_conversion_batch.sh:
+calib_quest2camera_file="camera_params/quest_realsense/calib_result_quest2camera.npy"
+# If capturing natively at 640x480, also set:
+# resolution_resize="640x480"
+
+bash scripts_data/zarr_human_data_conversion_batch.sh
+```
+
+> **Notes:**
+> - RealSense data only supports `mode="o"` (RGB only) during conversion; depth/stereo/pointcloud modes require ZED.
+> - On macOS, use `n_encoding_threads=1` in the conversion script to avoid multiprocessing issues.
+> - You will need to design your own mount to attach the RealSense to the Quest headset (the provided `assets/Zed-V2.STL` is ZED2-specific).
 
 ## (3) MotionTrans Dataset
 

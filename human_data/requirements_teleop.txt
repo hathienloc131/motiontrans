@@ -1,0 +1,32 @@
+# Requirements for human data teleop collection
+# Install: pip install -r human_data/requirements_teleop.txt
+
+# Core numerics
+numpy==1.24.4
+scipy==1.10.1
+
+# Computer vision
+opencv-python==4.9.0.80
+Pillow
+
+# RealSense camera
+pyrealsense2
+
+# Video I/O
+imageio
+imageio-ffmpeg
+
+# Networking / IPC
+pyzmq
+
+# Hand retargeting
+dex_retargeting==0.4.6
+
+# Utilities
+tqdm
+keyboard
+PyYAML
+
+# 3D visualization (optional, for debugging)
+# open3d
+# viser

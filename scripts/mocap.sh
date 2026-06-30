@@ -1,8 +1,8 @@
 # bash scripts/mocap.sh
 
-output_dir="data/data_human_raw"
-mp4_crop_w=640
-mp4_crop_h=480
+output_dir="data/raw_data/raw_data_human/human_test"
+mp4_crop_w=1280
+mp4_crop_h=720
 mp4_downsample_ratio=2
 camera_exposure=50
 

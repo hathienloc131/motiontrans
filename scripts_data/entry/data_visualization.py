@@ -22,6 +22,22 @@ from diffusion_policy.codecs.imagecodecs_numcodecs import register_codecs
 register_codecs()
 
 
+def _project_and_draw(img, pts_world, cam_mat, K, color_bgr, radius):
+    """Project 3D points (T0-cam world coords) onto img and draw filled circles."""
+    import cv2
+    R = cam_mat[:3, :3]
+    t = cam_mat[:3, 3]
+    h, w = img.shape[:2]
+    for pt in pts_world:
+        pt_cam = R.T @ (np.asarray(pt) - t)
+        if pt_cam[2] <= 0:
+            continue
+        px = K @ pt_cam / pt_cam[2]
+        u, v = int(round(float(px[0]))), int(round(float(px[1])))
+        if 0 <= u < w and 0 <= v < h:
+            cv2.circle(img, (u, v), radius, color_bgr, -1)
+
+
 def visualization_hand(server, point_nodes, frame_nodes, i, wrist_pose, finger_pos, is_right,
                        color=np.array([0, 0, 255]), point_size=0.01):
     if wrist_pose is not None:
@@ -79,6 +95,7 @@ def visualization(
 
     # Add playback UI.
     with server.gui.add_folder("Playback"):
+        gui_rgb_image = server.gui.add_image(videos[0], label="Camera RGB")
         gui_point_size = server.gui.add_slider(
             "Point size",
             min=0.001,
@@ -136,6 +153,7 @@ def visualization(
             # Toggle visibility.
             frame_nodes[current_timestep].visible = True
             frame_nodes[prev_timestep].visible = False
+        gui_rgb_image.image = videos[current_timestep]
         prev_timestep = current_timestep
         server.flush()  # Optional!
 
@@ -398,12 +416,65 @@ def main(args):
     else:
         right_finger_pos = None
 
+    # Raw human hand poses (original, pre-retargeting) for 2D overlay projection
+    raw_right_wrist   = episode['right_wrist_pose']   if 'right_wrist_pose'   in episode.keys() else None  # (T, 6)
+    raw_left_wrist    = episode['left_wrist_pose']    if 'left_wrist_pose'    in episode.keys() else None  # (T, 6)
+    raw_right_fingers = episode['right_finger_pose']  if 'right_finger_pose'  in episode.keys() else None  # (T, 5, 6)
+    raw_left_fingers  = episode['left_finger_pose']   if 'left_finger_pose'   in episode.keys() else None  # (T, 5, 6)
+
+    if args.rgb_only:
+        import cv2 as _cv2
+
+        # Precompute per-frame camera matrices and intrinsics for projection
+        if args.project_hands:
+            cam_mats = pose_to_mat(camera_poses)          # (T, 4, 4)
+            if intrinsic.ndim == 3:
+                Ks = intrinsic[:, :3, :3]                 # (T, 3, 3)
+            else:
+                Ks = np.broadcast_to(intrinsic[:3, :3], (len(videos), 3, 3)).copy()
+
+        print(f"Playing {len(videos)} frames. Press SPACE to pause/resume, Q to quit, arrow keys to step.")
+        playing = True
+        i = 0
+        while True:
+            frame = _cv2.cvtColor(videos[i].copy(), _cv2.COLOR_RGB2BGR)
+
+            if args.project_hands:
+                K = Ks[i]
+                M = cam_mats[i]
+                # Right hand: wrist (blue, larger) + 5 finger tips (cyan)
+                if raw_right_wrist is not None:
+                    _project_and_draw(frame, [raw_right_wrist[i, :3]], M, K, (200, 80, 0), 10)
+                if raw_right_fingers is not None:
+                    _project_and_draw(frame, raw_right_fingers[i, :, :3], M, K, (255, 180, 0), 7)
+                # Left hand: wrist (red, larger) + 5 finger tips (orange)
+                if raw_left_wrist is not None:
+                    _project_and_draw(frame, [raw_left_wrist[i, :3]], M, K, (0, 80, 200), 10)
+                if raw_left_fingers is not None:
+                    _project_and_draw(frame, raw_left_fingers[i, :, :3], M, K, (0, 180, 255), 7)
+
+            _cv2.imshow("RGB + Hand Pose" if args.project_hands else "RGB Visualization", frame)
+            key = _cv2.waitKey(1 if playing else 0) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord(' '):
+                playing = not playing
+            elif key == 81 or key == ord('a'):  # left arrow
+                i = max(0, i - 1)
+                playing = False
+            elif key == 83 or key == ord('d'):  # right arrow
+                i = min(len(videos) - 1, i + 1)
+                playing = False
+            elif playing:
+                i = (i + 1) % len(videos)
+        _cv2.destroyAllWindows()
+        return
+
     import imageio
     video_writer = imageio.get_writer("videos.mp4")
     for i in range(len(videos)):
         video_writer.append_data(videos[i])
     video_writer.close()
-
 
     visualization(videos, intrinsic, pointclouds_vis, camera_poses, left_wrist_pose, right_wrist_pose, left_finger_pos,
                   right_finger_pos)
@@ -417,6 +488,8 @@ if __name__ == "__main__":
                             help="Downsample factor for rgb/depth visualization.")
     arg_parser.add_argument("-d", "--disable_pointclouds", action="store_true", help="Also visualization pointclouds.")
     arg_parser.add_argument("-p", "--precheck_pointclouds", action="store_true", help="Also visualization pointclouds.")
+    arg_parser.add_argument("--rgb_only", action="store_true", help="Play RGB frames with cv2, no viser/WebGL needed.")
+    arg_parser.add_argument("--project_hands", action="store_true", help="Overlay projected hand joints on RGB frames (requires --rgb_only).")
     args = arg_parser.parse_args()
 
     main(args)

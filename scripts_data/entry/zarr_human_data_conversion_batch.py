@@ -340,23 +340,40 @@ def conversion_single_trajectory(
             episode["camera0_" + key] = np.array([val] * episode_length)
 
         ts_path = os.path.join(save_dir, "camera_timestamps.npy")
-        frames = list(reader)
-        reader.close()
-        n_frames = len(frames)
         if os.path.exists(ts_path):
             frame_timestamps = np.load(ts_path)
+            n_frames = len(frame_timestamps)
         else:
             fps = meta.get('fps', 30.0)
+            cap = cv2.VideoCapture(mp4_path)
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
             frame_timestamps = episode['timestamp'][0] + np.arange(n_frames) / fps
+
+        # Compute which video frame each episode step maps to
+        desired_frame_idxs = np.array([
+            min(int(np.argmin(np.abs(frame_timestamps - episode['timestamp'][i]))), n_frames - 1)
+            for i in range(episode_length)
+        ])
 
         transform_img = get_image_transform_resize_crop(input_res=(width, height), output_resize_res=out_resolutions_resize, output_crop_res=out_resolutions_crop, bgr_to_rgb=False)
 
         episode['camera0_rgb'] = np.zeros((episode_length, out_resolutions_image_final[1], out_resolutions_image_final[0], 3), dtype=np.uint8)
+
+        # Stream video frames instead of loading all into memory; cache only frames needed
+        needed_idxs = set(desired_frame_idxs.tolist())
+        max_needed_idx = int(desired_frame_idxs.max()) if len(desired_frame_idxs) > 0 else 0
+        frame_cache = {}
+        for i, frame in enumerate(reader):
+            if i in needed_idxs:
+                frame_cache[i] = frame
+            if i >= max_needed_idx:
+                break
+        reader.close()
+
         for global_idx in range(episode_length):
-            t = episode['timestamp'][global_idx]
-            frame_idx = int(np.argmin(np.abs(frame_timestamps - t)))
-            frame_idx = min(frame_idx, n_frames - 1)
-            frame = transform_img(frames[frame_idx])
+            frame_idx = desired_frame_idxs[global_idx]
+            frame = transform_img(frame_cache[frame_idx])
             frame = cv2.resize(frame, out_resolutions_image_final, interpolation=cv2.INTER_LINEAR)
             episode['camera0_rgb'][global_idx] = frame
             episode['camera0_real_timestamp'][global_idx] = frame_timestamps[frame_idx]
@@ -521,6 +538,7 @@ def main(input_dir, output, calib_quest2camera_file,
     for input_dir in input_dir_list:
         input_folder = input_dir.split('/')[-1]
         embodiment = input_folder.split('_')[0]
+        print(embodiment)
         assert embodiment == "human"
         environment_setting = input_folder.split('_')[1]
         instruction = '_'.join(input_folder.split('_')[2:])

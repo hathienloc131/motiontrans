@@ -102,7 +102,8 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
     quest = KeyboardQuestRecorder(args.output_dir)
     print("Recorder Initialization completed")
-    print("Press [SPACE] in the camera window to start/stop recording. Press [Q] or Ctrl+C to quit.")
+    print("Step 1: Do ONE left-middle-pinch on Quest to start hand data streaming.")
+    print("Step 2: Press [SPACE] in the camera window to start/stop each episode. [Q] to quit.")
 
     # blank window for keyboard capture when no camera
     if args.no_camera:

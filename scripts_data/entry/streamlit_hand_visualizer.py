@@ -481,6 +481,161 @@ def _build_3d_animation(episode_dir: str) -> go.Figure:
 
 
 # ---------------------------------------------------------------------------
+# F285 gripper: per-finger reach ratio (no URDF / dex_retargeting needed)
+#
+# Joint layout (from JOINT_NAMES / Unity XR Hands, 0-indexed):
+#   wrist=0
+#   thumb:  cmc=1, mcp=2, ip=3,  tip=4,  aux=5
+#   index:  mcp=6, pip=7, dip=8,  tip=9,  aux=10
+#   middle: mcp=11,pip=12,dip=13, tip=14, aux=15
+#   ring:   mcp=16,pip=17,dip=18, tip=19, aux=20
+#   pinky:  mcp=21,pip=22,dip=23, tip=24, aux=25
+#
+# Reach ratio = ||tip - MCP|| / (MCP→PIP + PIP→DIP + DIP→tip)
+#   open (straight finger) ≈ 0.92-1.0
+#   cup grasp (L-shape at PIP) ≈ 0.45-0.65
+#   fist (fully curled) ≈ 0.15-0.35
+# ---------------------------------------------------------------------------
+
+_WRIST_IDX = 0
+_FINGER_NAMES = ["index", "middle", "ring", "pinky"]  # thumb excluded (stays abducted)
+
+# (MCP, PIP, DIP, TIP) indices per finger — used for reach ratio
+_FINGER_JOINT_IDXS = [
+    (6,  7,  8,  9),   # index
+    (11, 12, 13, 14),  # middle
+    (16, 17, 18, 19),  # ring
+    (21, 22, 23, 24),  # pinky
+]
+
+# Thumb separately: (CMC, MCP, IP, TIP)
+_THUMB_JOINT_IDXS = (1, 2, 3, 4)
+
+
+def _jpos(inv_w, idx, data_t):
+    """Position of joint `idx` in wrist frame."""
+    return (inv_w @ euler_pose_to_mat(data_t[idx*6:(idx+1)*6]))[:3, 3]
+
+
+def _reach_ratio_from_joints(inv_w, mcp_idx, pip_idx, dip_idx, tip_idx, data_t):
+    """Wrist-relative reach ratio for one finger."""
+    mcp, pip = _jpos(inv_w, mcp_idx, data_t), _jpos(inv_w, pip_idx, data_t)
+    dip, tip = _jpos(inv_w, dip_idx, data_t), _jpos(inv_w, tip_idx, data_t)
+    span = np.linalg.norm(pip - mcp) + np.linalg.norm(dip - pip) + np.linalg.norm(tip - dip)
+    return np.linalg.norm(tip - mcp) / (span + 1e-6)
+
+
+def _pip_angle_deg(inv_w, mcp_idx, pip_idx, dip_idx, data_t):
+    """Angle at PIP joint in degrees. 180°=straight, 90°=L-shape (cup grasp)."""
+    mcp, pip = _jpos(inv_w, mcp_idx, data_t), _jpos(inv_w, pip_idx, data_t)
+    dip      = _jpos(inv_w, dip_idx, data_t)
+    v1, v2 = mcp - pip, dip - pip
+    cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+    return float(np.degrees(np.arccos(np.clip(cos_a, -1, 1))))
+
+
+# MCP indices of the 4 non-thumb fingers (used for palm-plane fitting)
+_FINGER_MCP_IDXS = [6, 11, 16, 21]   # index, middle, ring, pinky
+
+
+def _palm_plane(inv_w, data_t):
+    """
+    Best-fit plane through the 4 non-thumb MCP joints (in wrist frame).
+    Returns (normal, centroid) where normal points palmward (toward thumb_tip side).
+    """
+    mcps = np.array([_jpos(inv_w, i, data_t) for i in _FINGER_MCP_IDXS])
+    centroid = mcps.mean(axis=0)
+    _, _, Vt = np.linalg.svd(mcps - centroid)
+    normal = Vt[-1]                             # smallest variance → plane normal
+    thumb_tip = _jpos(inv_w, 4, data_t)         # thumb_tip idx=4
+    if np.dot(normal, thumb_tip - centroid) < 0:
+        normal = -normal                        # ensure normal points toward thumb side
+    return normal, centroid
+
+
+def _thumb_metrics(inv_w, data_t):
+    """
+    Two metrics for whether the thumb has swung into the finger plane (cup grasp check).
+
+    elevation_angle_deg:
+        Angle between thumb axis (CMC→tip) and the palm plane (= 4-finger MCP plane).
+        0°  → thumb lies flat IN the palm plane  ("cùng mặt phẳng" ✓)
+        90° → thumb sticks straight out of the palm (fully abducted/open)
+        For cup grasp target: < 30°
+
+    coplanar_dist_m:
+        Signed distance of thumb_tip from the palm plane (metres).
+        ≈ 0  → thumb tip in plane with MCPs
+        > 0  → thumb tip above palm plane (still spread out)
+        < 0  → thumb tip below palm plane (over-curled)
+    """
+    normal, centroid = _palm_plane(inv_w, data_t)
+    thumb_cmc = _jpos(inv_w, 1, data_t)   # CMC idx=1
+    thumb_tip = _jpos(inv_w, 4, data_t)   # tip idx=4
+
+    # Elevation angle
+    v = thumb_tip - thumb_cmc
+    nv = np.linalg.norm(v)
+    if nv > 1e-6:
+        sin_elev = abs(np.dot(v / nv, normal))
+        elevation = float(np.degrees(np.arcsin(np.clip(sin_elev, 0.0, 1.0))))
+    else:
+        elevation = 0.0
+
+    # Coplanar distance (signed)
+    coplanar = float(np.dot(thumb_tip - centroid, normal))
+
+    return elevation, coplanar
+
+
+@st.cache_data(show_spinner="Computing hand closure (reach ratios + thumb)…")
+def compute_hand_closure(episode_dir: str):
+    """
+    Per-frame metrics for both hands.
+
+    Returns:
+      right_reach      : (T, 4)  reach ratios  [index, middle, ring, pinky]
+      left_reach       : (T, 4)
+      right_pip        : (T, 4)  PIP angles °   (180=straight, 90=L-shape/cup)
+      left_pip         : (T, 4)
+      right_mean       : (T,)    mean reach ratio (used for F285 mapping)
+      left_mean        : (T,)
+      right_thumb_elev : (T,)    thumb elevation angle ° from palm plane (0=in-plane)
+      left_thumb_elev  : (T,)
+      right_thumb_dist : (T,)    signed dist of thumb_tip from palm plane (m)
+      left_thumb_dist  : (T,)
+    """
+    ep_dir = Path(episode_dir)
+    with open(ep_dir / "episode.pkl", "rb") as f:
+        ep = pickle.load(f)
+
+    T = len(ep["timestamp"])
+    right_reach = np.zeros((T, 4));  left_reach = np.zeros((T, 4))
+    right_pip   = np.zeros((T, 4));  left_pip   = np.zeros((T, 4))
+    right_elev  = np.zeros(T);       left_elev  = np.zeros(T)
+    right_dist  = np.zeros(T);       left_dist  = np.zeros(T)
+
+    for hand_key, reach_out, pip_out, elev_out, dist_out in [
+        ("right_hand_mat", right_reach, right_pip, right_elev, right_dist),
+        ("left_hand_mat",  left_reach,  left_pip,  left_elev,  left_dist),
+    ]:
+        data = ep[hand_key].astype(np.float64)
+        for t in range(T):
+            wrist = euler_pose_to_mat(data[t, _WRIST_IDX*6:(_WRIST_IDX+1)*6])
+            inv_w = fast_mat_inv(wrist)
+            for fi, (mcp, pip, dip, tip) in enumerate(_FINGER_JOINT_IDXS):
+                reach_out[t, fi] = _reach_ratio_from_joints(inv_w, mcp, pip, dip, tip, data[t])
+                pip_out[t, fi]   = _pip_angle_deg(inv_w, mcp, pip, dip, data[t])
+            elev_out[t], dist_out[t] = _thumb_metrics(inv_w, data[t])
+
+    return (right_reach, left_reach,
+            right_pip,   left_pip,
+            right_reach.mean(axis=1), left_reach.mean(axis=1),
+            right_elev, left_elev,
+            right_dist, left_dist)
+
+
+# ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
@@ -607,6 +762,69 @@ with st.sidebar:
     calib_dx = c1.slider("dx (mm, cam X)", -300, 300, 0, 5, key="cdx")
     calib_dy = c2.slider("dy (mm, cam Y)", -300, 300, 0, 5, key="cdy")
     calib_depth_scale = st.slider("Depth scale", 0.3, 2.0, 1.0, 0.05, key="cds")
+
+    st.divider()
+    st.header("F285 Gripper")
+    st.caption(
+        "Robotiq 2F-85 retargeting: maps thumb-to-index pinch distance "
+        "to driver joint [0 = open, 0.8 = closed]."
+    )
+    st.caption(
+        "reach_ratio = ‖tip − MCP‖ / finger_span. "
+        "Open hand ≈ 0.92 · Cup grasp ≈ 0.50 · Fist ≈ 0.20"
+    )
+    st.markdown("**Right hand**")
+    f285_open_ratio_right = st.slider(
+        "R open ratio (reach_ratio → joint=0)",
+        min_value=0.70, max_value=1.00, value=0.98, step=0.01,
+        format="%.2f", key="f285_or_right",
+    )
+    st.markdown("**Left hand**")
+    f285_open_ratio_left = st.slider(
+        "L open ratio (reach_ratio → joint=0)",
+        min_value=0.70, max_value=1.00, value=0.94, step=0.01,
+        format="%.2f", key="f285_or_left",
+    )
+    thumb_dist_thresh = st.slider(
+        "Thumb coplanar dist threshold (m) — dist ≤ this = 'cùng mặt phẳng' ✓",
+        min_value=0.005, max_value=0.15, value=0.04, step=0.005,
+        format="%.3f", key="thumb_thresh",
+        help="Signed distance of thumb_tip from 4-finger MCP plane. ≤ 0.04 m = thumb in-plane.",
+    )
+    f285_close_ramp_k = st.number_input(
+        "Close ramp k (frames before close event → interpolate 0→0.8)",
+        min_value=0, max_value=50, value=5, step=1, key="f285_ramp_k",
+        help="Số frame trước mỗi lần hand close sẽ được ramp tuyến tính 0 → 0.8. 0 = tắt.",
+    )
+
+    with st.expander("Scan episodes to calibrate open_dist"):
+        n_scan = st.number_input("Episodes to scan", min_value=1, max_value=max(1, len(raw_dirs)), value=min(5, len(raw_dirs)), step=1, key="n_scan")
+        if st.button("Run scan", key="run_scan"):
+            scan_right, scan_left = [], []
+            prog = st.progress(0.0, text="Scanning…")
+            for si, ep_d in enumerate(raw_dirs[:int(n_scan)]):
+                try:
+                    rr, lr, rp, lp, rm, lm, re, le, rd, ld = compute_hand_closure(ep_d)
+                    scan_right.append(rm)
+                    scan_left.append(lm)
+                except Exception:
+                    pass
+                prog.progress((si + 1) / int(n_scan), text=f"Scanned {si+1}/{int(n_scan)}")
+            prog.empty()
+            if scan_right:
+                all_r = np.concatenate(scan_right)
+                all_l = np.concatenate(scan_left)
+                for hand, arr in [("Right mean reach ratio", all_r), ("Left mean reach ratio", all_l)]:
+                    st.markdown(f"**{hand}** ({len(arr)} frames, {len(scan_right)} episodes)")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("min (fist)", f"{arr.min():.3f}")
+                    c2.metric("p5", f"{np.percentile(arr, 5):.3f}")
+                    c3.metric("p95 (open)", f"{np.percentile(arr, 95):.3f}")
+                    c4.metric("max", f"{arr.max():.3f}")
+                st.info(
+                    "Set **open ratio** ≈ p95 (relaxed open hand). "
+                    "Set **closed ratio** ≈ p5 (tightest grasp observed)."
+                )
 
 # ---------------------------------------------------------------------------
 # Load data
@@ -757,10 +975,295 @@ with col_rgb:
     _player()
 
 # ---------------------------------------------------------------------------
-# Debug expanders — full-width below columns, reads current frame from state
+# F285 Gripper — time-series chart + per-frame gauges (full-width)
 # ---------------------------------------------------------------------------
 
 t_dbg = min(st.session_state.get("frame_slider", 0), T - 1)
+
+st.divider()
+st.subheader("F285 Gripper (Robotiq 2F-85)")
+
+try:
+    (_right_reach, _left_reach,
+     _right_pip,   _left_pip,
+     _right_mean,  _left_mean,
+     _right_elev,  _left_elev,
+     _right_dist,  _left_dist) = compute_hand_closure(selected_ep)
+
+    # Full-episode binary closed arrays (both reach AND thumb conditions)
+    _r_closed_bin = (_right_mean <= f285_open_ratio_right) & (_right_dist <= thumb_dist_thresh)
+    _l_closed_bin = (_left_mean  <= f285_open_ratio_left)  & (_left_dist  <= thumb_dist_thresh)
+
+    def _apply_ramp_vis(closed_bin, k):
+        """Binary 0/0.8 signal with optional k-frame linear ramp before each close event."""
+        k = int(k)
+        result = np.where(closed_bin, 0.8, 0.0)
+        if k <= 0:
+            return result
+        rising = np.where((~closed_bin[:-1]) & closed_bin[1:])[0] + 1
+        ramp_template = np.linspace(0.0, 0.8, k + 1)[1:]
+        for t_c in rising:
+            t_start = max(0, t_c - k)
+            n = t_c - t_start
+            ramp = ramp_template[-n:]
+            mask = ~closed_bin[t_start:t_c]
+            result[t_start:t_c][mask] = ramp[mask]
+        return result
+
+    _right_f285 = _apply_ramp_vis(_r_closed_bin, f285_close_ramp_k)
+    _left_f285  = _apply_ramp_vis(_l_closed_bin,  f285_close_ramp_k)
+
+    # ---- Combined grasp indicator at current frame ----
+    _r_fingers_ok = bool(_right_mean[t_dbg] <= f285_open_ratio_right)
+    _r_thumb_ok   = bool(_right_dist[t_dbg] <= thumb_dist_thresh)
+    _l_fingers_ok = bool(_left_mean[t_dbg]  <= f285_open_ratio_left)
+    _l_thumb_ok   = bool(_left_dist[t_dbg]  <= thumb_dist_thresh)
+
+    _r_grasp = _r_fingers_ok and _r_thumb_ok
+    _l_grasp = _l_fingers_ok and _l_thumb_ok
+
+    ga1, ga2 = st.columns(2)
+    with ga1:
+        status = "🟢 GRASPING" if _r_grasp else ("🟡 fingers only" if _r_fingers_ok else ("🟡 thumb only" if _r_thumb_ok else "🔴 OPEN"))
+        st.markdown(f"**Right hand** &nbsp; {status}")
+    with ga2:
+        status = "🟢 GRASPING" if _l_grasp else ("🟡 fingers only" if _l_fingers_ok else ("🟡 thumb only" if _l_thumb_ok else "🔴 OPEN"))
+        st.markdown(f"**Left hand** &nbsp; {status}")
+
+    # ---- Per-frame metric grid ----
+    gc1, gc2, gc3, gc4, gc5, gc6 = st.columns(6)
+    gc1.metric("R reach ratio", f"{_right_mean[t_dbg]:.3f}", help="open≈0.92  cup≈0.50  fist≈0.20")
+    gc2.metric("R thumb dist (m)", f"{_right_dist[t_dbg]:.4f}",
+               delta=f"{'✓ in-plane' if _r_thumb_ok else '✗ spread'}", delta_color="off",
+               help=f"≤ {thumb_dist_thresh:.3f} m = thumb in-plane")
+    gc3.metric("R thumb elev°", f"{_right_elev[t_dbg]:.1f}°")
+    gc4.metric("L reach ratio", f"{_left_mean[t_dbg]:.3f}")
+    gc5.metric("L thumb dist (m)", f"{_left_dist[t_dbg]:.4f}",
+               delta=f"{'✓ in-plane' if _l_thumb_ok else '✗ spread'}", delta_color="off",
+               help=f"≤ {thumb_dist_thresh:.3f} m = thumb in-plane")
+    gc6.metric("L thumb elev°", f"{_left_elev[t_dbg]:.1f}°")
+
+    gc1b, gc2b = st.columns(2)
+    with gc1b:
+        st.caption("Right F285")
+        _rv = float(_right_f285[t_dbg] / 0.8)
+        st.progress(_rv, text=f"{_right_f285[t_dbg]:.3f}  ({'CLOSED' if _rv > 0.75 else 'OPEN' if _rv < 0.25 else 'mid'})")
+    with gc2b:
+        st.caption("Left F285")
+        _lv = float(_left_f285[t_dbg] / 0.8)
+        st.progress(_lv, text=f"{_left_f285[t_dbg]:.3f}  ({'CLOSED' if _lv > 0.75 else 'OPEN' if _lv < 0.25 else 'mid'})")
+
+    # ---- Chart tabs: reach ratios | PIP angles ----
+    hand_choice = st.radio("Show hand", ["Right", "Left"], horizontal=True, key="f285_hand")
+    _is_right   = hand_choice == "Right"
+    _reach = _right_reach if _is_right else _left_reach
+    _pip   = _right_pip   if _is_right else _left_pip
+    _mean  = _right_mean  if _is_right else _left_mean
+    _f285  = _right_f285  if _is_right else _left_f285
+    _open_ratio = f285_open_ratio_right if _is_right else f285_open_ratio_left
+
+    frames_idx = np.arange(len(_mean))
+    _FINGER_COLORS = ["#44cc88", "#4488ff", "#cc44cc", "#ff6644"]  # index→pinky
+
+    tab_reach, tab_pip, tab_thumb, tab_oc = st.tabs(["Reach ratio", "PIP angle (°)", "Thumb (in-plane check)", "Open / Close"])
+
+    with tab_reach:
+        fig_r = go.Figure()
+        for fi, (fname, fcol) in enumerate(zip(_FINGER_NAMES, _FINGER_COLORS)):
+            fig_r.add_trace(go.Scatter(
+                x=frames_idx, y=_reach[:, fi],
+                name=fname, line=dict(color=fcol, width=1.2, dash="dot"),
+            ))
+        fig_r.add_trace(go.Scatter(
+            x=frames_idx, y=_mean,
+            name="mean (→F285)", line=dict(color="white", width=2),
+        ))
+        fig_r.add_trace(go.Scatter(
+            x=frames_idx, y=_f285 / 0.8,       # normalised to [0,1] for overlay
+            name="F285 normalised", line=dict(color="#00e5ff", width=2),
+            fill="tozeroy", fillcolor="rgba(0,229,255,0.12)", yaxis="y2",
+        ))
+        fig_r.add_hline(y=_open_ratio, line=dict(color="orange", dash="dash", width=1.5),
+                        annotation_text=f"open={_open_ratio:.2f}", annotation_position="top right")
+        fig_r.add_vline(x=t_dbg, line=dict(color="yellow", dash="dash", width=2),
+                        annotation_text=f"t={t_dbg}", annotation_position="top left")
+        fig_r.update_layout(
+            xaxis_title="Frame",
+            yaxis=dict(title="Reach ratio [0–1]", range=[-0.05, 1.05]),
+            yaxis2=dict(title="F285 norm.", overlaying="y", side="right", range=[-0.05, 1.05], showgrid=False),
+            paper_bgcolor="rgb(15,15,25)", plot_bgcolor="rgb(25,25,40)", font_color="white",
+            legend=dict(bgcolor="rgba(20,20,40,0.8)", orientation="h", y=1.10, x=0),
+            height=320, margin=dict(l=0, r=60, t=50, b=30),
+        )
+        st.plotly_chart(fig_r, use_container_width=True, key="f285_reach_chart")
+
+    with tab_pip:
+        fig_p = go.Figure()
+        for fi, (fname, fcol) in enumerate(zip(_FINGER_NAMES, _FINGER_COLORS)):
+            fig_p.add_trace(go.Scatter(
+                x=frames_idx, y=_pip[:, fi],
+                name=fname, line=dict(color=fcol, width=1.5),
+            ))
+        fig_p.add_hline(y=180, line=dict(color="gray",   dash="dot",  width=1), annotation_text="straight (180°)")
+        fig_p.add_hline(y=90,  line=dict(color="orange", dash="dash", width=1), annotation_text="L-shape / cup (90°)")
+        fig_p.add_vline(x=t_dbg, line=dict(color="yellow", dash="dash", width=2),
+                        annotation_text=f"t={t_dbg}", annotation_position="top left")
+        fig_p.update_layout(
+            xaxis_title="Frame",
+            yaxis=dict(title="PIP angle (°)", range=[0, 200]),
+            paper_bgcolor="rgb(15,15,25)", plot_bgcolor="rgb(25,25,40)", font_color="white",
+            legend=dict(bgcolor="rgba(20,20,40,0.8)", orientation="h", y=1.10, x=0),
+            height=320, margin=dict(l=0, r=60, t=50, b=30),
+        )
+        st.plotly_chart(fig_p, use_container_width=True, key="f285_pip_chart")
+
+    with tab_thumb:
+        _elev = _right_elev if hand_choice == "Right" else _left_elev
+        _dist = _right_dist if hand_choice == "Right" else _left_dist
+
+        fig_th = go.Figure()
+        # Elevation angle — primary axis
+        fig_th.add_trace(go.Scatter(
+            x=frames_idx, y=_elev,
+            name="thumb elevation (°)", line=dict(color="#f0a830", width=2),
+        ))
+        # Coplanar distance — secondary axis
+        fig_th.add_trace(go.Scatter(
+            x=frames_idx, y=_dist,
+            name="thumb_tip dist from palm plane (m)", line=dict(color="#cc88ff", width=1.5, dash="dot"),
+            yaxis="y2",
+        ))
+        # Threshold reference
+        fig_th.add_hline(y=thumb_dist_thresh, yref="y2",
+                         line=dict(color="tomato", dash="dash", width=2),
+                         annotation_text=f"dist threshold {thumb_dist_thresh:.3f} m (in-plane ↓)",
+                         annotation_position="top right")
+        fig_th.add_hline(y=0, yref="y2",
+                         line=dict(color="gray", dash="dot", width=1))
+        fig_th.add_vline(x=t_dbg, line=dict(color="yellow", dash="dash", width=2),
+                         annotation_text=f"t={t_dbg}", annotation_position="top left")
+        fig_th.update_layout(
+            xaxis_title="Frame",
+            yaxis=dict(title="Elevation angle (°)", range=[-5, 95]),
+            yaxis2=dict(title="Coplanar dist (m)", overlaying="y", side="right",
+                        range=[float(_dist.min()) * 1.2 - 0.01, float(_dist.max()) * 1.2 + 0.01],
+                        showgrid=False),
+            paper_bgcolor="rgb(15,15,25)", plot_bgcolor="rgb(25,25,40)", font_color="white",
+            legend=dict(bgcolor="rgba(20,20,40,0.8)", orientation="h", y=1.10, x=0),
+            height=320, margin=dict(l=0, r=80, t=50, b=30),
+        )
+        st.plotly_chart(fig_th, use_container_width=True, key="f285_thumb_chart")
+        st.caption(
+            "**Elevation angle** = angle between thumb axis (CMC→tip) and the palm plane "
+            "(plane through index/middle/ring/pinky MCPs). "
+            "0° = thumb lies flat in same plane as fingers. "
+            "**Coplanar dist** = signed distance of thumb tip from that plane."
+        )
+
+    with tab_oc:
+        # Use the ramped F285 signal (same as process data)
+        # Right: positive [0, 0.8], Left: negative [0, -0.8]
+        _oc_right =  _right_f285            # 0=open, ramp up, 0.8=closed
+        _oc_left  = -_left_f285             # 0=open, ramp down, -0.8=closed
+
+        fig_oc = go.Figure()
+        # Ramped signal — Right (up)
+        fig_oc.add_trace(go.Scatter(
+            x=frames_idx, y=_oc_right,
+            name="Right (F285)", fill="tozeroy",
+            fillcolor="rgba(68,136,255,0.25)",
+            line=dict(color="#4488ff", width=2),
+        ))
+        # Ramped signal — Left (down)
+        fig_oc.add_trace(go.Scatter(
+            x=frames_idx, y=_oc_left,
+            name="Left (F285)", fill="tozeroy",
+            fillcolor="rgba(255,68,68,0.25)",
+            line=dict(color="#ff4444", width=2),
+        ))
+        # Binary closed markers as step background
+        fig_oc.add_trace(go.Scatter(
+            x=frames_idx, y=_r_closed_bin.astype(float) * 0.8,
+            name="R binary closed", line=dict(color="#aaccff", width=1, dash="dot", shape="hv"),
+            opacity=0.5,
+        ))
+        fig_oc.add_trace(go.Scatter(
+            x=frames_idx, y=-_l_closed_bin.astype(float) * 0.8,
+            name="L binary closed", line=dict(color="#ffaaaa", width=1, dash="dot", shape="hv"),
+            opacity=0.5,
+        ))
+        fig_oc.add_hline(y=0,    line=dict(color="rgba(255,255,255,0.3)", width=1))
+        fig_oc.add_hline(y=0.8,  line=dict(color="#4488ff", dash="dash", width=1),
+                         annotation_text="R max (0.8)", annotation_position="top right")
+        fig_oc.add_hline(y=-0.8, line=dict(color="#ff4444", dash="dash", width=1),
+                         annotation_text="L max (0.8)", annotation_position="bottom right")
+        fig_oc.add_vline(x=t_dbg, line=dict(color="yellow", dash="dash", width=2),
+                         annotation_text=f"t={t_dbg}", annotation_position="top left")
+        fig_oc.update_layout(
+            xaxis_title="Frame",
+            yaxis=dict(
+                tickvals=[-0.8, -0.4, 0, 0.4, 0.8],
+                ticktext=["L 0.8", "L 0.4", "open", "R 0.4", "R 0.8"],
+                range=[-0.95, 0.95],
+            ),
+            paper_bgcolor="rgb(15,15,25)", plot_bgcolor="rgb(25,25,40)", font_color="white",
+            legend=dict(bgcolor="rgba(20,20,40,0.8)", orientation="h", y=1.12, x=0),
+            height=320, margin=dict(l=0, r=80, t=50, b=30),
+        )
+        st.plotly_chart(fig_oc, use_container_width=True, key="f285_oc_chart")
+        st.caption(
+            "**Blue (up)** = right F285 qpos — ramp k={k} frames trước close, max 0.8 khi closed. "
+            "**Red (down)** = left F285. Đường dot = binary closed step (không có ramp).".format(k=int(f285_close_ramp_k))
+        )
+
+    # ---- Per-finger table at current frame ----
+    with st.expander(f"Per-finger values at frame {t_dbg}"):
+        import pandas as pd
+        rows_frame = []
+        for hand_lbl, reach_arr, pip_arr, mean_arr, elev_arr, dist_arr, open_ratio in [
+            ("Right", _right_reach, _right_pip, _right_mean, _right_elev, _right_dist, f285_open_ratio_right),
+            ("Left",  _left_reach,  _left_pip,  _left_mean,  _left_elev,  _left_dist,  f285_open_ratio_left),
+        ]:
+            row = {"hand": hand_lbl}
+            for fi, fname in enumerate(_FINGER_NAMES):
+                row[f"{fname} reach"] = f"{reach_arr[t_dbg, fi]:.3f}"
+                row[f"{fname} PIP°"]  = f"{pip_arr[t_dbg, fi]:.1f}"
+            row["mean reach"] = f"{mean_arr[t_dbg]:.3f}"
+            row[f"≤{open_ratio:.2f}?"] = "✓" if mean_arr[t_dbg] <= open_ratio else "✗"
+            row["thumb dist m"] = f"{dist_arr[t_dbg]:.4f}"
+            row["≤0.04m?"] = "✓" if dist_arr[t_dbg] <= thumb_dist_thresh else "✗"
+            row["thumb elev°"] = f"{elev_arr[t_dbg]:.1f}"
+            row["GRASP"] = "✓" if (mean_arr[t_dbg] <= open_ratio and dist_arr[t_dbg] <= thumb_dist_thresh) else "✗"
+            rows_frame.append(row)
+        st.dataframe(pd.DataFrame(rows_frame).set_index("hand"))
+
+    with st.expander("Reach ratio stats (this episode)"):
+        import pandas as pd
+        pcts = [0, 5, 25, 50, 75, 95, 100]
+        rows_stat = []
+        for fi, fname in enumerate(_FINGER_NAMES):
+            rows_stat.append({
+                "finger": fname,
+                **{f"R p{p}": float(np.percentile(_right_reach[:, fi], p)) for p in pcts},
+                **{f"L p{p}": float(np.percentile(_left_reach[:,  fi], p)) for p in pcts},
+            })
+        rows_stat.append({
+            "finger": "MEAN",
+            **{f"R p{p}": float(np.percentile(_right_mean, p)) for p in pcts},
+            **{f"L p{p}": float(np.percentile(_left_mean,  p)) for p in pcts},
+        })
+        st.dataframe(pd.DataFrame(rows_stat).set_index("finger").style.format("{:.3f}"))
+        st.caption(
+            "Set **open ratio** ≈ MEAN R p95 (relaxed open hand). "
+            "Set **closed ratio** ≈ MEAN R p5 (tightest cup grasp)."
+        )
+
+except Exception as _e:
+    st.warning(f"F285 computation failed: {_e}")
+
+# ---------------------------------------------------------------------------
+# Debug expanders — full-width below columns, reads current frame from state
+# ---------------------------------------------------------------------------
 if use_calib_file and calib_ok:
     _T_q2c   = np.load(calib_path)
     _vr2cam0 = compute_calib_vr2cam(_T_q2c, ep["head_pose_mat"][0].astype(np.float64))

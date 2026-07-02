@@ -21,6 +21,7 @@ try:
     from common.svo_utils import SVOReader
 except Exception:
     SVOReader = None
+from scipy.spatial.transform import Rotation as _Rotation
 from common.pose_util import euler_pose_to_mat, mat_to_pose, mat_to_euler_pose, pose_to_mat
 from common.interpolation_util import PoseInterpolator, get_interp1d
 from human_data.constants import yfxrzu2standard
@@ -44,16 +45,18 @@ def fast_mat_inv(mat):
 
 def conversion_single_trajectory(
     mode,
-    save_dir, 
+    save_dir,
     calib_quest2camera,
     speed_downsample_ratio,
     single_arm,
     hand_shrink_coef,
+    gripper_type: str = 'inspire_hand',  # 'inspire_hand' | 'gripper_f285'
+    f285_close_ramp_k: int = 5,
     out_resolutions_resize: Union[None, tuple, Dict[str,tuple]]=None, # (width, height)
     out_resolutions_crop: Union[None, tuple, Dict[str,tuple]]=None, # (width, height)
     out_resolutions_image_final: Union[None, tuple, Dict[str,tuple]]=None, # (width, height)
     network_delay_checking: float=1.0,
-    num_points_final: int = 2048, 
+    num_points_final: int = 2048,
     points_max_distance_final: float = 1.25,
     ):
 
@@ -148,8 +151,9 @@ def conversion_single_trajectory(
             - left/right_qpos_results:   (T, 6),    inspire_hand 6dof servo-pos  (pinky, ring, middle, index, thumb-curve, thumb-inside)
             - left/right_opos_results:   (T, 5, 6), original hand 6dof poses in T0-Camera-Coordinate  (thumb, index, middle, ring, pinky)
     """
-    left_hand_wrists, right_hand_wrists, left_hand_fix_wrists, right_hand_fix_wrists, left_hand_qposes, right_hand_qposes, left_hand_urdf_qposes, right_hand_urdf_qposes, left_org_hand_poses, right_org_hand_poses = \
-        hand_retargeting.retarget(left_hand_pose, right_hand_pose)
+    left_hand_wrists, right_hand_wrists, left_hand_fix_wrists, right_hand_fix_wrists, left_hand_qposes, right_hand_qposes, left_hand_urdf_qposes, right_hand_urdf_qposes, left_org_hand_poses, right_org_hand_poses, left_f285_qposes, right_f285_qposes = \
+        hand_retargeting.retarget(left_hand_pose, right_hand_pose,
+                                  f285_close_ramp_k=f285_close_ramp_k)
 
     # ========================== Transfer from Euler to RotVec to adapt to Diffusion Policy Controller ==================
     left_hand_wrists = mat_to_pose(euler_pose_to_mat(left_hand_wrists))
@@ -159,11 +163,27 @@ def conversion_single_trajectory(
     left_org_hand_poses = mat_to_pose(euler_pose_to_mat(left_org_hand_poses.reshape(-1, 6))).reshape(-1, 5, 6)
     right_org_hand_poses = mat_to_pose(euler_pose_to_mat(right_org_hand_poses.reshape(-1, 6))).reshape(-1, 5, 6)
 
+    # ── cm → m ────────────────────────────────────────────────────────────────
+    _S = 0.01
+    right_hand_wrists[:, :3] *= _S;        left_hand_wrists[:, :3] *= _S
+    right_hand_fix_wrists[:, :3] *= _S;    left_hand_fix_wrists[:, :3] *= _S
+    right_org_hand_poses[:, :, :3] *= _S;  left_org_hand_poses[:, :, :3] *= _S
+    for _j in range(right_hand_pose_rotvec.shape[1] // 6):
+        right_hand_pose_rotvec[:, _j*6:_j*6+3] *= _S
+        left_hand_pose_rotvec[:, _j*6:_j*6+3] *= _S
+    camera_pose[:, :3, 3] *= _S  # scale before mat_to_pose
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # For F285: shift EEF from wrist to pinch point (0.145 m along wrist Z / finger direction).
+    if gripper_type == 'gripper_f285':
+        _F285_PINCH_M = 0.145
+        right_hand_fix_wrists[:, :3] += _Rotation.from_rotvec(right_hand_fix_wrists[:, 3:]).as_matrix()[:, :, 2] * _F285_PINCH_M
+        if not single_arm:
+            left_hand_fix_wrists[:, :3]  += _Rotation.from_rotvec(left_hand_fix_wrists[:, 3:]).as_matrix()[:, :, 2]  * _F285_PINCH_M
 
     episode = dict()
     episode['timestamp'] = timestamps
     episode_length = len(episode['timestamp'])
-    # episode['hint'] = np.array(["All poses are in T0-Camera-Coordinate"])
     episode['left_hand_pose'] = left_hand_pose_rotvec
     episode['right_hand_pose'] = right_hand_pose_rotvec
     episode['left_wrist_pose'] = left_hand_wrists
@@ -179,22 +199,30 @@ def conversion_single_trajectory(
         episode['robot1_eef_pos'] = left_hand_fix_wrists[:, :3]
         episode['robot1_eef_rot_axis_angle'] = left_hand_fix_wrists[:, 3:]
 
-    if hand_shrink_coef is not None and hand_shrink_coef != 1.0:
-        right_hand_qposes_delta = (right_hand_qposes[1:] - right_hand_qposes[:-1]) * hand_shrink_coef
-        left_hand_qposes_delta = (left_hand_qposes[1:] - left_hand_qposes[:-1]) * hand_shrink_coef
-        right_hand_urdf_qposes_delta = (right_hand_urdf_qposes[1:] - right_hand_urdf_qposes[:-1]) * hand_shrink_coef
-        left_hand_urdf_qposes_delta = (left_hand_urdf_qposes[1:] - left_hand_urdf_qposes[:-1]) * hand_shrink_coef
-        right_hand_qposes = np.concatenate([np.ones((1, right_hand_qposes.shape[1])) * right_hand_qposes[0:1], right_hand_qposes_delta]).cumsum(axis=0)
-        left_hand_qposes = np.concatenate([np.ones((1, left_hand_qposes.shape[1])) * left_hand_qposes[0:1], left_hand_qposes_delta]).cumsum(axis=0)
-        right_hand_urdf_qposes = np.concatenate([np.ones((1, right_hand_urdf_qposes.shape[1])) * right_hand_urdf_qposes[0:1], right_hand_urdf_qposes_delta]).cumsum(axis=0)
-        left_hand_urdf_qposes = np.concatenate([np.ones((1, left_hand_urdf_qposes.shape[1])) * left_hand_urdf_qposes[0:1], left_hand_urdf_qposes_delta]).cumsum(axis=0)
+    if gripper_type == 'inspire_hand':
+        if hand_shrink_coef is not None and hand_shrink_coef != 1.0:
+            right_hand_qposes_delta = (right_hand_qposes[1:] - right_hand_qposes[:-1]) * hand_shrink_coef
+            left_hand_qposes_delta = (left_hand_qposes[1:] - left_hand_qposes[:-1]) * hand_shrink_coef
+            right_hand_urdf_qposes_delta = (right_hand_urdf_qposes[1:] - right_hand_urdf_qposes[:-1]) * hand_shrink_coef
+            left_hand_urdf_qposes_delta = (left_hand_urdf_qposes[1:] - left_hand_urdf_qposes[:-1]) * hand_shrink_coef
+            right_hand_qposes = np.concatenate([np.ones((1, right_hand_qposes.shape[1])) * right_hand_qposes[0:1], right_hand_qposes_delta]).cumsum(axis=0)
+            left_hand_qposes = np.concatenate([np.ones((1, left_hand_qposes.shape[1])) * left_hand_qposes[0:1], left_hand_qposes_delta]).cumsum(axis=0)
+            right_hand_urdf_qposes = np.concatenate([np.ones((1, right_hand_urdf_qposes.shape[1])) * right_hand_urdf_qposes[0:1], right_hand_urdf_qposes_delta]).cumsum(axis=0)
+            left_hand_urdf_qposes = np.concatenate([np.ones((1, left_hand_urdf_qposes.shape[1])) * left_hand_urdf_qposes[0:1], left_hand_urdf_qposes_delta]).cumsum(axis=0)
 
-    episode['gripper0_gripper_pose'] = right_hand_qposes
-    episode['urdf_gripper0_gripper_pose'] = right_hand_urdf_qposes
+        episode['gripper0_gripper_pose'] = right_hand_qposes          # (T, 6)
+        episode['urdf_gripper0_gripper_pose'] = right_hand_urdf_qposes
+        if single_arm is False:
+            episode['gripper1_gripper_pose'] = left_hand_qposes       # (T, 6)
+            episode['urdf_gripper1_gripper_pose'] = left_hand_urdf_qposes
 
-    if single_arm is False:
-        episode['gripper1_gripper_pose'] = left_hand_qposes
-        episode['urdf_gripper1_gripper_pose'] = left_hand_urdf_qposes
+    elif gripper_type == 'gripper_f285':
+        episode['gripper0_gripper_pose'] = right_f285_qposes[:, None]  # (T, 1)
+        if single_arm is False:
+            episode['gripper1_gripper_pose'] = left_f285_qposes[:, None]  # (T, 1)
+
+    else:
+        raise ValueError(f"Unknown gripper_type: {gripper_type!r}. Choose 'inspire_hand' or 'gripper_f285'.")
 
     # ========================== Transformation to Egocentric View (By Default T=0 Head View) =================================
 
@@ -465,10 +493,12 @@ def conversion_single_trajectory(
 
 
 def conversion_trajectory(input_data_fp_list, calib_quest2camera, speed_downsample_ratio, single_arm,
-                          hand_shrink_coef, 
-                          mode, 
+                          hand_shrink_coef,
+                          gripper_type,
+                          f285_close_ramp_k,
+                          mode,
                           out_resolutions_resize, out_resolutions_crop, resolution_image_final, num_points_final, points_max_distance_final,
-                          replay_buffer, 
+                          replay_buffer,
                           network_delay_checking,
                           process_id):
     pbar = tqdm(enumerate(input_data_fp_list), desc=f"Process {process_id}")
@@ -476,11 +506,13 @@ def conversion_trajectory(input_data_fp_list, calib_quest2camera, speed_downsamp
         save_dir, source, source_idx = input_data_fp
         episode = conversion_single_trajectory(
             mode,
-            save_dir, 
+            save_dir,
             calib_quest2camera,
             speed_downsample_ratio,
             single_arm,
             hand_shrink_coef,
+            gripper_type,
+            f285_close_ramp_k,
             out_resolutions_resize,
             out_resolutions_crop,
             resolution_image_final,
@@ -515,13 +547,20 @@ def conversion_trajectory(input_data_fp_list, calib_quest2camera, speed_downsamp
 @click.option('--points_max_distance_final', '-pmdf', type=float, default=1.0)
 @click.option('--n_encoding_threads', '-ne', default=-1, type=int)
 @click.option('--network_delay_checking', '-dl', default=0.5, help="Max network delay for tolerance.")
-def main(input_dir, output, calib_quest2camera_file, 
+@click.option('--gripper_type', '-gt', default='inspire_hand',
+              type=click.Choice(['inspire_hand', 'gripper_f285'], case_sensitive=False),
+              help="inspire_hand: 6-DOF Inspire Hand servo pos; gripper_f285: 1-DOF Robotiq 2F-85 driver joint [0, 0.8].")
+@click.option('--f285_close_ramp_k', '-rk', default=5, type=int,
+              help="F285 only: ramp k frames before each hand-close event from 0 → 0.8. 0 = disabled.")
+def main(input_dir, output, calib_quest2camera_file,
          adapt_config_file, single_arm,
          default_speed_downsample_ratio, default_hand_shrink_coef,
-         mode, 
+         mode,
          resolution_resize, resolution_crop, resolution_image_final, num_use_source, num_points_final, points_max_distance_final,
-         n_encoding_threads, 
-         network_delay_checking
+         n_encoding_threads,
+         network_delay_checking,
+         gripper_type,
+         f285_close_ramp_k,
         ):
     out_resolution_resize = tuple(int(x) for x in resolution_resize.split('x'))
     out_resolution_crop = tuple(int(x) for x in resolution_crop.split('x'))
@@ -606,14 +645,14 @@ def main(input_dir, output, calib_quest2camera_file,
 
             process_list = []
             for i in range(n_encoding_threads):
-                p = Process(target=conversion_trajectory, args=(input_data_fp_batch_list[i], calib_quest2camera, speed_downsample_ratio, single_arm, hand_shrink_coef, mode, out_resolution_resize, out_resolution_crop, resolution_image_final, num_points_final, points_max_distance_final, replay_buffer, network_delay_checking, i))
+                p = Process(target=conversion_trajectory, args=(input_data_fp_batch_list[i], calib_quest2camera, speed_downsample_ratio, single_arm, hand_shrink_coef, gripper_type, f285_close_ramp_k, mode, out_resolution_resize, out_resolution_crop, resolution_image_final, num_points_final, points_max_distance_final, replay_buffer, network_delay_checking, i))
                 p.start()
                 process_list.append(p)
 
             for p in process_list:
                 p.join()
         else:
-            conversion_trajectory(input_data_fp_list, calib_quest2camera, speed_downsample_ratio, single_arm, hand_shrink_coef, mode, out_resolution_resize, out_resolution_crop, resolution_image_final, num_points_final, points_max_distance_final, replay_buffer, network_delay_checking, 0)
+            conversion_trajectory(input_data_fp_list, calib_quest2camera, speed_downsample_ratio, single_arm, hand_shrink_coef, gripper_type, f285_close_ramp_k, mode, out_resolution_resize, out_resolution_crop, resolution_image_final, num_points_final, points_max_distance_final, replay_buffer, network_delay_checking, 0)
         
         print(f"Saving to disk finish: Task {input_dir}")
 

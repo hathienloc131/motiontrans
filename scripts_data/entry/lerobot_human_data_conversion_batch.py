@@ -480,10 +480,20 @@ def build_features(single_arm: bool, H: int, W: int, gripper_type: str = 'inspir
         action_names = action_names + extra
     dim = (6 + gripper_dim) if single_arm else 2 * (6 + gripper_dim)
     features = {
-        "observation.state": {"dtype": "float32", "shape": (dim,), "names": state_names},
-        "action":            {"dtype": "float32", "shape": (dim,), "names": action_names},
-        "observation.images.camera0": {"dtype": "video", "shape": (H, W, 3), "names": ["height", "width", "channels"]},
+        # all observation fields prefixed with "observation." per MotionTransDataset schema
+        "observation.images.camera0":              {"dtype": "video",    "shape": (H, W, 3),       "names": ["height", "width", "channels"]},
+        "observation.robot0_eef_pos":              {"dtype": "float32",  "shape": (3,),             "names": ["x", "y", "z"]},
+        "observation.robot0_eef_rot_axis_angle":   {"dtype": "float32",  "shape": (3,),             "names": ["rx", "ry", "rz"]},
+        "observation.gripper0_gripper_pose":       {"dtype": "float32",  "shape": (gripper_dim,),   "names": g0_names},
+        "observation.camera0_pose":                {"dtype": "float32",  "shape": (6,),             "names": ["x", "y", "z", "rx", "ry", "rz"]},
+        "observation.is_human":                    {"dtype": "float32",  "shape": (1,),             "names": None},
+        # action stays unprefixed (standard LeRobot convention)
+        "action":                                  {"dtype": "float32",  "shape": (dim,),           "names": action_names},
     }
+    if not single_arm:
+        features["observation.robot1_eef_pos"]            = {"dtype": "float32", "shape": (3,),           "names": ["x", "y", "z"]}
+        features["observation.robot1_eef_rot_axis_angle"] = {"dtype": "float32", "shape": (3,),           "names": ["rx", "ry", "rz"]}
+        features["observation.gripper1_gripper_pose"]     = {"dtype": "float32", "shape": (gripper_dim,), "names": g1_names}
     if vr_hand_dim > 0:
         _vr_joint_names = [
             "palm", "wrist",
@@ -504,20 +514,6 @@ def build_features(single_arm: bool, H: int, W: int, gripper_type: str = 'inspir
         features["observation.raw_vr_head_pose"]  = {"dtype": "float32", "shape": (6,), "names": ["x", "y", "z", "euler_x", "euler_y", "euler_z"]}
     return features
 
-
-def get_observation_state(episode: dict, t: int, single_arm: bool) -> np.ndarray:
-    parts = [
-        episode["robot0_eef_pos"][t],
-        episode["robot0_eef_rot_axis_angle"][t],
-        episode["gripper0_gripper_pose"][t],
-    ]
-    if not single_arm:
-        parts += [
-            episode["robot1_eef_pos"][t],
-            episode["robot1_eef_rot_axis_angle"][t],
-            episode["gripper1_gripper_pose"][t],
-        ]
-    return np.concatenate(parts).astype(np.float32)
 
 
 def conversion_lerobot_trajectory(
@@ -575,10 +571,18 @@ def conversion_lerobot_trajectory(
 
         for t in range(T):
             frame = {
-                "observation.state": get_observation_state(episode, t, single_arm),
-                "action": episode["action"][t].astype(np.float32),
-                "observation.images.camera0": episode["camera0_rgb"][t],
+                "observation.images.camera0":            (episode["camera0_rgb"][t] / 255.0).astype(np.float32),
+                "observation.robot0_eef_pos":            episode["robot0_eef_pos"][t].astype(np.float32),
+                "observation.robot0_eef_rot_axis_angle": episode["robot0_eef_rot_axis_angle"][t].astype(np.float32),
+                "observation.gripper0_gripper_pose":     episode["gripper0_gripper_pose"][t].astype(np.float32),
+                "observation.camera0_pose":              episode["camera0_pose"][t].astype(np.float32),
+                "observation.is_human":                  np.array([1.0], dtype=np.float32),
+                "action":                                episode["action"][t].astype(np.float32),
             }
+            if not single_arm:
+                frame["observation.robot1_eef_pos"]            = episode["robot1_eef_pos"][t].astype(np.float32)
+                frame["observation.robot1_eef_rot_axis_angle"] = episode["robot1_eef_rot_axis_angle"][t].astype(np.float32)
+                frame["observation.gripper1_gripper_pose"]     = episode["gripper1_gripper_pose"][t].astype(np.float32)
             if save_raw_vr and "raw_vr_left_hand" in episode:
                 frame["observation.raw_vr_left_hand"]  = episode["raw_vr_left_hand"][t]
                 frame["observation.raw_vr_right_hand"] = episode["raw_vr_right_hand"][t]
@@ -725,6 +729,8 @@ def main(
             robot_type="human_vr",
             use_videos=True,
             tolerance_s=1.0 / fps,
+            image_writer_processes=4,
+            image_writer_threads=8,
         )
 
         with VideoEncodingManager(dataset):

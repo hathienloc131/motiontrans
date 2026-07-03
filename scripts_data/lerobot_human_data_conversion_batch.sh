@@ -2,7 +2,7 @@
 
 input_dir="/Users/lochathien/Documents/data/raw_data/raw_data_human"
 num_use_source=-1                # how many sources to use per task, -1 means all
-n_demos="10"                       # max demos to convert per task, empty = full dataset
+n_demos=""                       # max demos to convert per task, empty = full dataset
 output_dir="data/human_stack_cup"
 calib_quest2camera_file="camera_params/quest_realsense/calib_result_quest2camera.npy"
 adapt_config_file="scripts_data/human_data_adapt.json"
@@ -24,7 +24,6 @@ lerobot_src_path="/Users/lochathien/Documents/Code/vr_lfd/src"
 PYTHON="/opt/homebrew/Caskroom/miniconda/base/envs/lerobot/bin/python"
 
 ${PYTHON} -m scripts_data.entry.lerobot_human_data_conversion_batch \
-  --single_arm \
   --input_dir ${input_dir} \
   --output ${output_dir} \
   --calib_quest2camera_file ${calib_quest2camera_file} \
@@ -44,4 +43,4 @@ ${PYTHON} -m scripts_data.entry.lerobot_human_data_conversion_batch \
   --network_delay_checking ${network_delay_checking} \
   --repo_id ${repo_id} \
   --fps ${fps} \
-  --lerobot_src_path ${lerobot_src_path} -srv
+  --lerobot_src_path ${lerobot_src_path}

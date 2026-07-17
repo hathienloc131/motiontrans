@@ -434,13 +434,25 @@ def conversion_single_trajectory(
                 interp1 = get_interp1d(episode["timestamp"][[frame_release, fr_end]], episode["gripper1_gripper_pose"][[frame_release, fr_end]])
                 episode["gripper1_gripper_pose"][frame_release + 1:fr_end] = interp1(episode["timestamp"][frame_release + 1:fr_end])
 
-    episode["action"] = np.concatenate([
-        episode["robot0_eef_pos"], episode["robot0_eef_rot_axis_angle"], episode["gripper0_gripper_pose"],
+    # GR00T layout for both state and action: per robot [eef_pos(3), eef_rot6d(6), gripper_pose(g)].
+    # rot6d = first two ROWS of the rotation matrix (pose_util.mat_to_rot6d convention).
+    def _rotvec_to_rot6d(rotvec):
+        return _Rotation.from_rotvec(rotvec).as_matrix()[:, :2, :].reshape(-1, 6)
+
+    state = np.concatenate([
+        episode["robot0_eef_pos"],
+        _rotvec_to_rot6d(episode["robot0_eef_rot_axis_angle"]),
+        episode["gripper0_gripper_pose"],
     ], axis=-1)
     if not single_arm:
-        episode["action"] = np.concatenate([
-            episode["action"], episode["robot1_eef_pos"], episode["robot1_eef_rot_axis_angle"], episode["gripper1_gripper_pose"],
+        state = np.concatenate([
+            state,
+            episode["robot1_eef_pos"],
+            _rotvec_to_rot6d(episode["robot1_eef_rot_axis_angle"]),
+            episode["gripper1_gripper_pose"],
         ], axis=-1)
+    episode["state"] = state
+    episode["action"] = state.copy()
 
     return episode
 
@@ -466,19 +478,18 @@ def build_features(single_arm: bool, H: int, W: int, gripper_type: str = 'inspir
         g0_names = ["gripper0_p0", "gripper0_p1", "gripper0_p2", "gripper0_p3", "gripper0_p4", "gripper0_p5"]
         g1_names = ["gripper1_p0", "gripper1_p1", "gripper1_p2", "gripper1_p3", "gripper1_p4", "gripper1_p5"]
         gripper_dim = 6
-    state_names = [
-        "robot0_eef_pos_x", "robot0_eef_pos_y", "robot0_eef_pos_z",
-        "robot0_eef_rot_x", "robot0_eef_rot_y", "robot0_eef_rot_z",
-    ] + g0_names
-    action_names = list(state_names)
+    # observation.state and action share the GR00T layout:
+    # per robot [eef_pos(3), eef_rot6d(6), gripper_pose(g)]
+    def _obs_state_names(i, g_names):
+        return [
+            f"robot{i}_eef_pos_x", f"robot{i}_eef_pos_y", f"robot{i}_eef_pos_z",
+        ] + [f"robot{i}_eef_rot6d_{k}" for k in range(6)] + g_names
+    obs_state_names = _obs_state_names(0, g0_names)
     if not single_arm:
-        extra = [
-            "robot1_eef_pos_x", "robot1_eef_pos_y", "robot1_eef_pos_z",
-            "robot1_eef_rot_x", "robot1_eef_rot_y", "robot1_eef_rot_z",
-        ] + g1_names
-        state_names = state_names + extra
-        action_names = action_names + extra
-    dim = (6 + gripper_dim) if single_arm else 2 * (6 + gripper_dim)
+        obs_state_names = obs_state_names + _obs_state_names(1, g1_names)
+    obs_state_dim = (9 + gripper_dim) if single_arm else 2 * (9 + gripper_dim)
+    action_names = list(obs_state_names)
+    dim = obs_state_dim
     features = {
         # all observation fields prefixed with "observation." per MotionTransDataset schema
         "observation.images.camera0":              {"dtype": "video",    "shape": (H, W, 3),       "names": ["height", "width", "channels"]},
@@ -486,6 +497,7 @@ def build_features(single_arm: bool, H: int, W: int, gripper_type: str = 'inspir
         "observation.robot0_eef_rot_axis_angle":   {"dtype": "float32",  "shape": (3,),             "names": ["rx", "ry", "rz"]},
         "observation.gripper0_gripper_pose":       {"dtype": "float32",  "shape": (gripper_dim,),   "names": g0_names},
         "observation.camera0_pose":                {"dtype": "float32",  "shape": (6,),             "names": ["x", "y", "z", "rx", "ry", "rz"]},
+        "observation.state":                       {"dtype": "float32",  "shape": (obs_state_dim,), "names": obs_state_names},
         "observation.is_human":                    {"dtype": "float32",  "shape": (1,),             "names": None},
         # action stays unprefixed (standard LeRobot convention)
         "action":                                  {"dtype": "float32",  "shape": (dim,),           "names": action_names},
@@ -576,6 +588,7 @@ def conversion_lerobot_trajectory(
                 "observation.robot0_eef_rot_axis_angle": episode["robot0_eef_rot_axis_angle"][t].astype(np.float32),
                 "observation.gripper0_gripper_pose":     episode["gripper0_gripper_pose"][t].astype(np.float32),
                 "observation.camera0_pose":              episode["camera0_pose"][t].astype(np.float32),
+                "observation.state":                     episode["state"][t].astype(np.float32),
                 "observation.is_human":                  np.array([1.0], dtype=np.float32),
                 "action":                                episode["action"][t].astype(np.float32),
             }
@@ -628,6 +641,8 @@ def conversion_lerobot_trajectory(
               help="Save raw VR hand joint poses and head pose (euler, VR world frame) in the dataset.")
 @click.option("--repo_id", default="human_demo/task", type=str,
               help="LeRobot repo_id prefix; per-task instruction suffix appended automatically.")
+@click.option("--language_instruction", "-li", default=None, type=str,
+              help="Language instruction stored in the dataset. Default: derived from folder name.")
 @click.option("--fps", default=30, type=int,
               help="Dataset fps. Should match Quest rate / speed_downsample_ratio.")
 @click.option("--lerobot_src_path", default="/Users/lochathien/Documents/Code/vr_lfd/src",
@@ -641,7 +656,7 @@ def main(
     num_use_source, n_demos, num_points_final, points_max_distance_final,
     n_encoding_threads, network_delay_checking,
     gripper_type, f285_close_ramp_k, save_raw_vr,
-    repo_id, fps, lerobot_src_path,
+    repo_id, language_instruction, fps, lerobot_src_path,
 ):
     out_resolution_resize = tuple(int(x) for x in resolution_resize.split("x"))
     out_resolution_crop = tuple(int(x) for x in resolution_crop.split("x"))
@@ -686,8 +701,10 @@ def main(
             task_speed_ratio = p.get("speed_downsample_ratio", default_speed_downsample_ratio)
             task_shrink_coef = p.get("hand_shrink_coef", default_hand_shrink_coef)
 
+        task_instruction = language_instruction if language_instruction is not None else instruction
+
         print(f"\nTask: {input_folder}")
-        print(f"  Instruction:            {instruction}")
+        print(f"  Instruction:            {task_instruction}")
         print(f"  Repo ID:                {task_repo_id}")
         print(f"  Output:                 {task_output_dir}")
         print(f"  speed_downsample_ratio: {task_speed_ratio}")
@@ -750,7 +767,7 @@ def main(
                 points_max_distance_final=points_max_distance_final,
                 network_delay_checking=network_delay_checking,
                 dataset=dataset,
-                task_instruction=instruction,
+                task_instruction=task_instruction,
                 fps=fps,
                 n_demos=n_demos,
                 save_raw_vr=save_raw_vr,

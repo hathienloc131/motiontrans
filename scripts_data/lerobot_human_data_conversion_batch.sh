@@ -1,6 +1,6 @@
 # bash scripts_data/lerobot_human_data_conversion_batch.sh
 
-input_dir="/Users/lochathien/Documents/data/raw_data/raw_data_human"
+input_dir="/Users/lochathien/Documents/Code/motiontrans/data/raw_data/raw_data_human"
 num_use_source=-1                # how many sources to use per task, -1 means all
 n_demos=""                       # max demos to convert per task, empty = full dataset
 output_dir="data/human_stack_cup"
@@ -15,7 +15,8 @@ network_delay_checking=0.5
 num_points_final=1024            # if save pointclouds, how many points to sample
 points_max_distance_final=1.0    # if save pointclouds, the max distance to keep points
 repo_id="human_demo/task"        # LeRobot repo_id prefix; per-task instruction suffix appended automatically
-fps=30                           # dataset fps (should match Quest recording rate / downsample_ratio)
+language_instruction="Stack the three cups together."          # language instruction stored in the dataset, empty = derive from folder name
+fps=25                           # dataset fps (should match Quest recording rate / downsample_ratio)
 lerobot_src_path="/Users/lochathien/Documents/Code/vr_lfd/src"
 
 # Use the lerobot conda env Python (has lerobot + motiontrans deps).
@@ -33,7 +34,7 @@ ${PYTHON} -m scripts_data.entry.lerobot_human_data_conversion_batch \
   --gripper_type ${gripper_type} \
   --f285_close_ramp_k ${f285_close_ramp_k} \
   --mode ${mode} \
-  --resolution_resize 1280x720 \
+  --resolution_resize 960x600 \
   --resolution_crop 960x600 \
   --resolution_image_final 960x600 \
   --num_use_source ${num_use_source} \
@@ -42,5 +43,6 @@ ${PYTHON} -m scripts_data.entry.lerobot_human_data_conversion_batch \
   --points_max_distance_final ${points_max_distance_final} \
   --network_delay_checking ${network_delay_checking} \
   --repo_id ${repo_id} \
+  ${language_instruction:+--language_instruction "${language_instruction}"} \
   --fps ${fps} \
   --lerobot_src_path ${lerobot_src_path}
